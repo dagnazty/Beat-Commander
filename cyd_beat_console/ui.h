@@ -4,7 +4,7 @@
 #include <stdlib.h>
 #include "gfx.h"
 
-#define FW_VERSION "v1.0.5"
+#define FW_VERSION "v1.2.0"
 
 enum Mode : uint8_t { M_FOLLOW, M_TAKE };
 enum LinkState : uint8_t { LS_WAIT, LS_LIVE, LS_HOLD, LS_TAKE };
@@ -19,6 +19,8 @@ struct UiState {
   int nudgeMs = 0;                              // total phase nudge this takeover
   int pressed = -1;                             // button being held
   bool viaBooth = false;                        // following a booth controller rather than a LoRa conductor
+  bool direct = false;                          // following the USB S3 directly over ESP-NOW
+  bool perf = false;                            // direct USB beat sourced from PERF-1 MIDI clock
 };
 
 // ---------- layout ----------
@@ -54,9 +56,9 @@ static void drawHeader(const UiState& s) {
   fillRect(0, Y_HEAD, SCR_W, H_HEAD, C_BLACK);
   alpha4(JACKAL_S, JACKAL_S_W, JACKAL_S_H, 5, 2, C_AMB);
   text(ORB_14, "BEAT CONSOLE", 33, 19, C_AMB);
-  text(STM_12, "916.0", 172, 18, C_DIM);
+  text(STM_12, s.direct ? "2.4G" : "916.0", 172, 18, C_DIM);
   const char* t; uint16_t c; bool solid = true;
-  if (!s.bridgeOk) { t = "NO LINK"; c = C_RED; solid = false; }
+  if (!s.bridgeOk && !s.direct && s.link == LS_WAIT) { t = "NO LINK"; c = C_RED; solid = false; }
   else switch (s.link) {
     case LS_LIVE: t = "LIVE"; c = C_GRN; break;
     case LS_HOLD: t = "HOLD"; c = C_AMB; break;
@@ -76,8 +78,8 @@ static void drawStage(const UiState& s) {
     fillRect(0, Y_STAGE, SCR_W, H_STAGE, C_BLACK);
     alpha4(JACKAL_L, JACKAL_L_W, JACKAL_L_H, 22, Y_STAGE + 8, scale(C_AMB, 210));
     text(ORB_20, "LISTENING", 128, Y_STAGE + 44, C_AMB);
-    text(STM_16, "beat link 916.0 MHz", 128, Y_STAGE + 66, C_GRN);
-    text(STM_12, "SF7 / BW500 via bridge", 128, Y_STAGE + 84, C_DIM);
+    text(STM_16, "waiting for a beat", 128, Y_STAGE + 66, C_GRN);
+    text(STM_12, "tap here for visuals", 128, Y_STAGE + 84, C_DIM);
     scanlines(0, Y_STAGE, SCR_W, H_STAGE, 200);
     return;
   }
@@ -96,10 +98,11 @@ static void drawStage(const UiState& s) {
   text(ORB_14, "BPM", x + 4, Y_STAGE + 60, bright ? C_BLACK : C_AMB);
 
   // source, top right
-  const char* src = s.mode == M_TAKE ? "CONSOLE" : s.link == LS_HOLD ? "FLYWHEEL" : s.viaBooth ? "BOOTH" : "CONDUCTOR";
+  const char* src = s.mode == M_TAKE ? "CONSOLE" : s.link == LS_HOLD ? "FLYWHEEL" : s.perf ? "PERF-1" : s.direct ? "USB S3" : s.viaBooth ? "BOOTH" : "CONDUCTOR";
   textR(STM_12, "SOURCE", SCR_W - 10, Y_STAGE + 16, bright ? C_BLACK : C_DIM);
   textR(ORB_14, src, SCR_W - 10, Y_STAGE + 33, bright ? C_BLACK : (s.mode == M_TAKE ? C_RED : C_GRN));
   brackets(4, Y_STAGE + 4, SCR_W - 8, H_STAGE - 8, 10, bright ? C_BLACK : C_DIM);
+  textR(STM_12, "TAP: VISUALS", SCR_W - 10, Y_STAGE + H_STAGE - 10, bright ? C_BLACK : C_DIM);
 
   if (s.conflict) {
     fillRect(0, Y_STAGE + H_STAGE - 20, SCR_W, 20, C_RED);
@@ -132,7 +135,7 @@ static void drawStats(const UiState& s) {
   char b[16];
   if (s.link == LS_WAIT && s.mode == M_FOLLOW) {
     if (!s.bridgeOk) {
-      text(STM_12, "NO BRIDGE: power on the Heltec V3 bridge", 8, Y_STATS + 15, C_RED);
+      text(STM_12, "NO BEAT: start USB S3, PERF-1 or bridge", 8, Y_STATS + 15, C_RED);
       text(STM_12, "(same LINK_NET_ID and ESP-NOW channel)", 8, Y_STATS + 30, C_DIM);
     } else {
       text(STM_12, s.radioOk ? "BRIDGE OK  //  LoRa radio OK" : "BRIDGE OK  //  LoRa radio FAILED", 8, Y_STATS + 15,
@@ -142,10 +145,15 @@ static void drawStats(const UiState& s) {
     return;
   }
   if (s.mode == M_TAKE) {
-    snprintf(b, sizeof(b), "%lu", (unsigned long)s.sent); cell(0, "SENT", b, C_GRN);
-    snprintf(b, sizeof(b), "%lu", (unsigned long)s.fail); cell(1, "FAIL", b, s.fail ? C_RED : C_GRN);
+    snprintf(b, sizeof(b), "%lu", (unsigned long)s.sent); cell(0, s.bridgeOk ? "SENT" : "LOCAL", b, C_GRN);
+    snprintf(b, sizeof(b), "%lu", (unsigned long)s.fail); cell(1, s.bridgeOk ? "FAIL" : "LINK", s.bridgeOk ? b : "DIRECT", s.fail ? C_RED : C_GRN);
     snprintf(b, sizeof(b), "%+d ms", s.nudgeMs); cell(2, "NUDGE", b, C_AMB);
     snprintf(b, sizeof(b), "%d", s.rssi); cell(3, "RSSI", s.rx ? b : "--", s.rx ? rssiColor(s.rssi) : C_GREY);
+  } else if (s.direct) {
+    snprintf(b, sizeof(b), "%lu", (unsigned long)s.rx); cell(0, "RX", b, C_GRN);
+    snprintf(b, sizeof(b), "%lu", (unsigned long)s.lost); cell(1, "LOST", b, s.lost ? C_AMB : C_GRN);
+    snprintf(b, sizeof(b), "%.1f", s.bpm); cell(2, "BPM", b, C_GRN);
+    cell(3, "LINK", "2.4G", C_AMB);
   } else {
     snprintf(b, sizeof(b), "%d", s.rssi); cell(0, "RSSI dBm", b, rssiColor(s.rssi));
     snprintf(b, sizeof(b), "%+.1f", s.snr); cell(1, "SNR dB", b, s.snr >= 0 ? C_GRN : C_AMB);

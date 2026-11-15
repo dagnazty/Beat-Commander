@@ -5,7 +5,7 @@
 // It also prints the Beat Gateway's serial feed, so Beat Hub can use it for Ableton Link and OSC (no MIDI clock).
 //
 // Wiring (no soldering if your board has header pins): strip 5V -> 5V / VBUS, GND -> GND, DIN -> the data pin
-// (default GPIO1; on a XIAO that's D0). Short strips run off USB; brightness is capped to a USB-safe current.
+// (default GPIO19 on DevKits; GPIO1 / D0 on XIAO). Short strips run off USB; brightness is capped.
 // Longer strips: their own 5V supply, with its GND joined to the board's GND.
 //
 // BOOT button: press = next pattern (the first LEDs show its number), hold 1.5 s = AUTO on (green) / off (red),
@@ -26,13 +26,16 @@
 #include "gateway.h"
 #include "strip.h"
 
-#define FW_VERSION "1.0"
+#define FW_VERSION "1.1"
+#define DIRECT_S3_FLAG 0x04
 #define P_BTN 28                 // BOOT on the XIAO, Espressif DevKitC-1 and Waveshare C5 boards
 #define P_ONBOARD 27             // XIAO: yellow user LED (active low). DevKits: WS2812 RGB LED.
 #ifdef BOARD_XIAO_C5
 #define BOARD_TXT "XIAO ESP32-C5"
+#define DEFAULT_DATA_PIN 1
 #else
 #define BOARD_TXT "ESP32-C5 DevKit"
+#define DEFAULT_DATA_PIN 19
 #endif
 
 #define LAT_FIRE_US  1000
@@ -41,7 +44,7 @@
 #define FREE_BEATS  8
 
 Preferences prefs;
-uint16_t nLeds = 60; uint8_t dataPin = 1, brightPct = 50, pattern = SP_PULSE; uint16_t limitMa = 900; bool autoMode = false;
+uint16_t nLeds = 60; uint8_t dataPin = DEFAULT_DATA_PIN, brightPct = 50, pattern = SP_PULSE; uint16_t limitMa = 900; bool autoMode = false;
 
 // ================= output to both USB serial and the UART (DevKits have a second USB port on the UART) =================
 void outf(const char* fmt, ...) {
@@ -128,6 +131,7 @@ int freeBeats = 0;
 uint32_t beatsReal = 0;
 int16_t rssi = 0;
 int64_t bridgeHelloUs = 0; bool bridgeRadio = false;
+bool directS3 = false;
 SState ss = {};
 
 void beat(int64_t tb, uint8_t no, bool real) {
@@ -151,11 +155,12 @@ void handle(const Ev& e) {
   if (f.type != LF_RELAY && f.type != LF_ACK && f.type != LF_FIRE) return;
   if (f.bpm10 < 300 || f.bpm10 > 3000) return;
   bool echo = f.flags & LINK_FLAG_ECHO;
+  bool fromS3 = f.type == LF_FIRE && (f.flags & DIRECT_S3_FLAG);
   Src s = (f.type == LF_RELAY && !echo) ? GS_AIR : GS_BOOTH;
   if (src != GS_NONE && s != src && e.t - srcLastUs < SRC_HOLD_US) return;
   if (s != src) outf("# source %s\n", srcName(s));
   src = s; srcLastUs = e.t;
-  int64_t lat = f.type == LF_FIRE ? LAT_FIRE_US : LAT_LORA_US + (echo ? 1000 : 0);
+  int64_t lat = fromS3 ? 0 : f.type == LF_FIRE ? LAT_FIRE_US : LAT_LORA_US + (echo ? 1000 : 0);
   int64_t tb = e.t - lat;
   uint32_t per = 600000000UL / f.bpm10;
   bool resync = false;
@@ -165,6 +170,7 @@ void handle(const Ev& e) {
     resync = !lastReal && gap < (int64_t)per / 2;
   }
   periodUs = per; bpm10 = f.bpm10; hue = f.hue; freeBeats = 0; beatsReal++;
+  directS3 = fromS3;
   if (f.type == LF_RELAY && !echo) rssi = f.rssi;
   if (resync) { lastBeatUs = tb; lastReal = true; beatNo = f.beat & 3; }
   else beat(tb, f.beat & 3, true);
@@ -181,7 +187,7 @@ void status() {
   int64_t now = esp_timer_get_time();
   const char* st = src == GS_NONE ? "WAIT" : freeBeats ? "FREE" : "LOCK";
   const char* br = bridgeHelloUs && now - bridgeHelloUs < 3000000 ? (bridgeRadio ? "OK" : "NORADIO") : "-";
-  outf("S,%s,%.1f,%s,%lu,STOP,%s,%lu\n", st, bpm10 / 10.0f, srcName(src), (unsigned long)beatsReal, br, (unsigned long)framesIn);
+  outf("S,%s,%.1f,%s,%lu,STOP,%s,%lu\n", st, bpm10 / 10.0f, directS3 && src != GS_NONE ? "S3" : srcName(src), (unsigned long)beatsReal, br, (unsigned long)framesIn);
 }
 void settings() {
   outf("# Beat Strip v%s (%s) | %u LEDs on GPIO%u | bright %u%% | limit %u mA (now ~%d) | pattern %s%s\n",
@@ -237,11 +243,18 @@ void setup() {
 #endif
   prefs.begin("beatstrip", false);
   nLeds = prefs.getUShort("leds", 60); if (nLeds < 1 || nLeds > STRIP_MAX) nLeds = 60;
-  dataPin = prefs.getUChar("pin", 1);
+  dataPin = prefs.getUChar("pin", DEFAULT_DATA_PIN);
   brightPct = prefs.getUChar("bright", 50); if (brightPct < 1 || brightPct > 100) brightPct = 50;
   limitMa = prefs.getUShort("limit", 900);
   ss.pattern = prefs.getUChar("pattern", SP_PULSE) % SP_COUNT;
   autoMode = prefs.getBool("auto", false);
+#ifndef BOARD_XIAO_C5
+  // Migrate an already-flashed GPIO1 build once; later pin commands remain saved.
+  if (!prefs.getBool("gpio19init", false)) {
+    dataPin = DEFAULT_DATA_PIN; ss.pattern = SP_PULSE; autoMode = false;
+    saveAll(); prefs.putBool("gpio19init", true);
+  }
+#endif
   ss.n = nLeds; ss.hue = 160;
   stripPinInit();
   evQ = xQueueCreate(16, sizeof(Ev));
@@ -267,6 +280,9 @@ void loop() {
     lastFrame = ms;
     ss.n = nLeds; ss.live = src != GS_NONE;
     stripRender(frame, ss, ms);
+#ifndef BOARD_XIAO_C5
+    if (!ss.live) memset(frame, 0, nLeds * 3); // no received beat: strip off
+#endif
     if ((int32_t)(testUntil - ms) > 0) {                              // test: one colour per quarter of the strip
       for (int i = 0; i < nLeds; i++) { int q = i * 4 / nLeds; frame[i * 3] = q == 0 || q == 3 ? 255 : 0; frame[i * 3 + 1] = q == 1 || q == 3 ? 255 : 0; frame[i * 3 + 2] = q >= 2 ? 255 : 0; }
     } else if ((int32_t)(fbUntil - ms) > 0) {                         // button feedback

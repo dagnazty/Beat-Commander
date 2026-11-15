@@ -54,7 +54,7 @@ void stripRender(uint8_t* rgb, const SState& s, uint32_t now) {
 
   switch (s.pattern) {
     case SP_PULSE: {                                                 // the whole strip hits and fades
-      float v = 0.06f + 0.94f * punch;
+      float v = punch;
       for (int i = 0; i < n; i++) put(i, r * v + white, g * v + white, b * v + white);
       break;
     }

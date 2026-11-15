@@ -1,28 +1,36 @@
 // CYD Beat Console: a touchscreen booth display for Beat Commander.
 // Board: ESP32-2432S028R "Cheap Yellow Display" (ESP32, 2.8" 320x240 ILI9341, XPT2046 resistive touch).
 //
-// A Heltec V3 running heltec_v3_espnow_bridge listens to the beat link (916.0 MHz LoRa) and relays every
-// beat here over ESP-NOW. The console shows the BPM huge, flashes in the conductor's colour on every beat,
-// and tracks RSSI / SNR / losses. TAKE hands the beat to the booth: the console keeps time itself (tap tempo,
-// +/- 0.1 BPM, 10 ms nudges) and the bridge transmits each beat on LoRa, so every follower keeps flashing.
+// Follows USB audio conductor beats directly over ESP-NOW, or LoRa beats relayed by a Heltec V3 bridge.
+// The console shows the BPM huge, flashes in the conductor's colour on every beat,
+// and tracks link health. TAKE keeps time locally (tap tempo, +/- 0.1 BPM, 10 ms nudges);
+// when a bridge is present it also transmits the beats on LoRa.
 //
 // Touch: TAP = tap tempo (first tap = downbeat; tapping while following takes over).
 //        -/+ = 0.1 BPM, hold for 1 BPM steps. Arrows = nudge the beat 10 ms earlier / later.
 //        TAKE / RELEASE = take the beat from the conductor, or hand it back.
+//        Tap BPM area = visuals; tap visual = next effect; hold 1 s = console.
+//        Tap AUTO at top right = cycle effects every 8 bars on/off.
 //        Hold the header 2 s = rotate 180 deg (remembered). Touch the splash at boot = calibrate touch.
 //
 // Built by Anubis Darkwatch with Claude. MIT license.
-// Arduino IDE 2.x, esp32 by Espressif (core 2.x or 3.x). Board "ESP32 Dev Module". No extra libraries.
+// Arduino IDE 2.x, esp32 by Espressif 3.x. ESP32 Dev Module, Huge APP. Library: LovyanGFX.
 
 #include <SPI.h>
 #include <WiFi.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
 #include <Preferences.h>
+#define LGFX_USE_V1
+#include <LovyanGFX.hpp>
 #include "link.h"
 #include "ui.h"
+#include "../beat_visualizer/viz.h"
 
-struct Snap { UiState s; uint32_t flashSeq, flashMs, nextExpect; bool flipReq; };   // UI snapshot of the beat engine
+struct Snap { UiState s; uint32_t flashSeq, flashMs, nextExpect; bool flipReq, visuals, autoViz; uint8_t visualMode; };
+LGFX_Sprite visualCanvas;
+VizState visualState = {};
+bool visualReady = false;
 struct Cal { uint8_t swap; float ax, bx, ay, by; };                                // touch calibration
 
 // ---------- options ----------
@@ -35,6 +43,8 @@ struct Cal { uint8_t swap; float ax, bx, ay, by; };                             
 #define LINK_AIR_MS    11    // during takeover, flash the console this long after sending: matches the followers
 #define FLYWHEEL_MS    4000  // keep the beat going this long after the last packet (same as the followers)
 #define DEBUG_TOUCH    0     // 1 = print raw touch values on serial
+#define USB_AUDIO_FLAG 0x04   // LF_FIRE from the USB S3 conductor also carries a direct CYD beat
+#define PERF_MIDI_FLAG 0x08   // direct beat came from PERF-1's USB MIDI clock
 
 // ---------- CYD pins ----------
 #define TFT_SCK 14
@@ -193,8 +203,11 @@ struct Core {
   int rssi = 0; float snr = 0; int nudgeMs = 0;
   uint32_t bridgeMs = 0, conflictUntil = 0; bool radioOk = false, bridgeSeen = false;
   bool viaBooth = false;             // the beat comes from a booth controller (StickS3, Dial, Tab5...) not a LoRa conductor
+  bool direct = false;               // the USB S3 conductor sent this beat straight to the CYD
+  bool perf = false;
   uint32_t flashSeq = 0, flashMs = 0; bool flashDown = false;
   int pressed = -1; bool flipReq = false;
+  bool visuals = false, autoViz = true; uint8_t visualMode = V_PULSE;
   uint32_t tapTimes[5]; int tapCount = 0;
   float frac = 0;                    // sub-millisecond remainder of the beat period, so long runs don't drift
 };
@@ -244,14 +257,30 @@ void tap(uint32_t now) {
 void onFrame(const uint8_t* d, int len) {
   if (!linkValid(d, len)) return;
   LinkFrame f; memcpy(&f, d, sizeof(f));
-  if (f.type != LF_FIRE) xQueueSend(rxQ, &f, 0);
+  if (f.type != LF_FIRE || (f.flags & USB_AUDIO_FLAG)) xQueueSend(rxQ, &f, 0);
 }
 
 void handleFrame(const LinkFrame& f, uint32_t now) {
+  if (f.type == LF_FIRE && (f.flags & USB_AUDIO_FLAG)) {
+    if (f.bpm10 < 700 || f.bpm10 > 1900) return;
+    if (core.mode == M_TAKE) { core.conflictUntil = now + 1500; return; }
+    if (core.gotAny && core.direct && now - core.lastRxMs < FLYWHEEL_MS) {
+      uint8_t gap = f.seq - core.lastSeq;
+      if (gap > 1 && gap < 64) core.lost += gap - 1;
+    }
+    core.direct = true; core.perf = f.flags & PERF_MIDI_FLAG;
+    core.viaBooth = false; core.lastSeq = f.seq; core.rx++;
+    core.gotAny = true; core.lastRxMs = now;
+    core.bpm = f.bpm10 / 10.0f; core.beatPos = f.beat & 3; core.hue = f.hue;
+    core.flyNext = now + (uint32_t)periodMs(core.bpm) + 40;
+    beatAt(now, core.beatPos == 0);
+    return;
+  }
   core.bridgeMs = now; core.bridgeSeen = true;
   if (f.type == LF_HELLO) { core.radioOk = f.flags & 1; return; }
   if (f.type == LF_ACK) { core.acks++; return; }
   if (f.type != LF_RELAY) return;
+  if (core.direct && now - core.lastRxMs < 120) return;  // bridge echo of the same USB beat
   core.radioOk = true;
   if (core.gotAny) { uint8_t gap = f.seq - core.lastSeq; if (gap > 1 && gap < 64) core.lost += gap - 1; }
   bool echo = f.flags & LINK_FLAG_ECHO;                // a booth controller mirroring the bridge's confirmation
@@ -261,6 +290,8 @@ void handleFrame(const LinkFrame& f, uint32_t now) {
   core.viaBooth = echo;
   if (core.mode == M_TAKE) { core.conflictUntil = now + 1500; return; }   // someone else is transmitting
   core.gotAny = true; core.lastRxMs = now;
+  core.direct = false;
+  core.perf = false;
   core.bpm = f.bpm10 / 10.0f; core.beatPos = f.beat & 3; core.hue = f.hue;
   core.flyNext = now + (uint32_t)periodMs(core.bpm) + 40;
   beatAt(now, core.beatPos == 0);
@@ -269,6 +300,16 @@ void handleFrame(const LinkFrame& f, uint32_t now) {
 // called with the lock held; the touch panel was read just before, outside the lock
 void touchStep(uint32_t now, bool down, int x, int y) {
   static bool was = false; static uint32_t downAt = 0, nextRep = 0; static int downBtn = -1; static bool headHold = false;
+  static int startX = 0, startY = 0;
+  if (down && !was) { startX = x; startY = y; downAt = now; }
+  if (core.visuals) {
+    if (!down && was) {
+      if (now - downAt >= 1000) core.visuals = false;
+      else if (startX >= 240 && startY < 40) core.autoViz = !core.autoViz;
+      else core.visualMode = (core.visualMode + 1) % V_COUNT;
+    }
+    was = down; return;
+  }
   if (down && !was) {
     downAt = now; headHold = y < H_HEAD; downBtn = hitButton(x, y);
     UiState tmp; tmp.mode = core.mode;
@@ -288,7 +329,11 @@ void touchStep(uint32_t now, bool down, int x, int y) {
       nextRep = now + 150;
     }
     if (headHold && y < H_HEAD + 20 && now - downAt > 2000) { core.flipReq = true; headHold = false; }
-  } else if (!down && was) { core.pressed = -1; headHold = false; }
+  } else if (!down && was) {
+    core.pressed = -1; headHold = false;
+    if (visualReady && startY >= Y_STAGE && startY < Y_STAGE + H_STAGE && now - downAt < 700)
+      core.visuals = true;
+  }
   was = down;
 }
 
@@ -313,11 +358,12 @@ void beatTask(void*) {
         core.beatPos = (core.beatPos + 1) & 3;
         if (core.beatPos == 0) core.hue += 40;            // new colour every bar, like the W10
         core.nextBeat += stepMs();
+        bool bridged = core.bridgeSeen && now - core.bridgeMs < 3000;
         core.fires++; core.lastFireMs = now;
         fr = linkFrame(LF_FIRE);
         fr.bpm10 = (uint16_t)(core.bpm * 10 + 0.5f); fr.beat = core.beatPos; fr.hue = core.hue;
-        fire = true;
-        beatAt(now + LINK_AIR_MS, core.beatPos == 0);
+        fire = bridged;
+        beatAt(now + (bridged ? LINK_AIR_MS : 0), core.beatPos == 0);
       }
     } else if (core.gotAny && core.bpm > 30 && now - core.lastRxMs < FLYWHEEL_MS &&
                (int32_t)(now - core.flyNext) >= 0) {   // packet missed: keep the beat going
@@ -344,6 +390,8 @@ void snapshot(Snap& n, uint32_t now) {
   UiState& s = n.s;
   s.mode = core.mode;
   s.bridgeOk = core.bridgeSeen && now - core.bridgeMs < 3000;
+  s.direct = core.direct && now - core.lastRxMs < FLYWHEEL_MS;
+  s.perf = s.direct && core.perf;
   s.radioOk = core.radioOk;
   s.conflict = core.mode == M_TAKE && (int32_t)(core.conflictUntil - now) > 0;
   if (core.mode == M_TAKE) s.link = LS_TAKE;
@@ -353,13 +401,14 @@ void snapshot(Snap& n, uint32_t now) {
   else s.link = LS_WAIT;
   s.bpm = core.bpm; s.beatPos = core.beatPos; s.hue = core.hue;
   s.rssi = core.rssi; s.snr = core.snr; s.rx = core.rx; s.lost = core.lost; s.viaBooth = core.viaBooth;
-  s.sent = core.acks;
+  s.sent = s.bridgeOk ? core.acks : core.fires;
   uint32_t pend = (core.fires > core.acks && now - core.lastFireMs < 80) ? 1 : 0;
-  s.fail = core.fires - core.acks - pend;
+  s.fail = s.bridgeOk ? core.fires - core.acks - pend : 0;
   s.nudgeMs = core.nudgeMs; s.pressed = core.pressed; s.downbeat = core.flashDown;
   n.flashSeq = core.flashSeq; n.flashMs = core.flashMs;
-  n.nextExpect = core.mode == M_TAKE ? core.nextBeat + LINK_AIR_MS : core.lastBeatMs + (uint32_t)periodMs(core.bpm);
+  n.nextExpect = core.mode == M_TAKE ? core.nextBeat + (s.bridgeOk ? LINK_AIR_MS : 0) : core.lastBeatMs + (uint32_t)periodMs(core.bpm);
   n.flipReq = core.flipReq; core.flipReq = false;
+  n.visuals = core.visuals; n.visualMode = core.visualMode; n.autoViz = core.autoViz;
   portEXIT_CRITICAL(&mux);
 }
 
@@ -448,6 +497,12 @@ void setup() {
   }
   if (doCal || !haveCal) calibrate();               // first boot always calibrates
 
+  vizInitFonts(); visualCanvas.setColorDepth(8);
+  visualReady = visualCanvas.createSprite(SCR_W, SCR_H) != nullptr;
+  if (!visualReady) Serial.println("# Visual canvas allocation failed");
+  core.visualMode = prefs.getUChar("vizmode", V_PULSE) % V_COUNT;
+  core.autoViz = prefs.getBool("vizauto", true);
+
   rxQ = xQueueCreate(16, sizeof(LinkFrame));
   if (!linkInit()) Serial.println("# ESP-NOW init failed");
   Serial.printf("# ESP-NOW ch %d, net 0x%02X | MAC %s\n", LINK_ESPNOW_CH, LINK_NET_ID, WiFi.macAddress().c_str());
@@ -461,16 +516,61 @@ void loop() {
   uint32_t now = millis();
   Snap n; snapshot(n, now);
   UiState& s = n.s;
+  static bool wasVisuals = false;
+  static uint8_t savedVisualMode = 255; static bool savedAuto = false;
+  if (n.visualMode != savedVisualMode || n.autoViz != savedAuto) {
+    savedVisualMode = n.visualMode; savedAuto = n.autoViz;
+    prefs.putUChar("vizmode", savedVisualMode); prefs.putBool("vizauto", savedAuto);
+    visualState.labelUntil = now + 1800;
+  }
+  if (n.flashSeq != visualState.beatId) {
+    visualState.beatId = n.flashSeq; visualState.beatMs = n.flashMs;
+    if (s.beatPos == 0) {
+      visualState.bars++;
+      if (n.autoViz && visualState.bars % 8 == 0) {
+        portENTER_CRITICAL(&mux); core.visualMode = (core.visualMode + 1) % V_COUNT; portEXIT_CRITICAL(&mux);
+      }
+    }
+  }
+  visualState.bpm = s.bpm; visualState.beatPos = s.beatPos; visualState.hue = s.hue;
+  visualState.mode = n.visualMode; visualState.autoMode = n.autoViz;
+  visualState.src = SRC_W10; visualState.hud = true;
+  visualState.hint = nullptr;
 
   if (n.flipReq) {
     flipped = !flipped; prefs.putBool("flip", flipped); tftRotate(); first = true;
   }
+  if (n.visuals && visualReady) {
+    static uint32_t lastVisualFrame = 0;
+    if (!wasVisuals) visualState.labelUntil = now + 2500;
+    wasVisuals = true; first = true;
+    if (now - lastVisualFrame >= 40) {
+      lastVisualFrame = now;
+      vizDraw(visualCanvas, visualState, now);
+      visualCanvas.setFont(&fonts::Font0);
+      visualCanvas.setTextDatum(top_left); visualCanvas.setTextColor(0xFFFF, 0);
+      visualCanvas.drawString("HOLD: CONSOLE", 4, 3);
+      visualCanvas.setTextDatum(top_right);
+      visualCanvas.drawString(n.autoViz ? "AUTO ON" : "AUTO OFF", SCR_W - 4, 3);
+      if (s.link == LS_WAIT) {
+        visualCanvas.setTextDatum(bottom_left);
+        visualCanvas.drawString("WAITING FOR BEATS", 4, SCR_H - 4);
+      }
+      for (int y = 0; y < SCR_H; y += BAND_H) {
+        band.y0 = y; band.h = min(BAND_H, SCR_H - y);
+        visualCanvas.readRect(0, y, SCR_W, band.h, reinterpret_cast<lgfx::rgb565_t*>(band.px));
+        panelPushBand();
+      }
+    }
+    delay(1); return;
+  }
+  wasVisuals = false;
   // flash animation
   if (n.flashSeq != seenSeq && (int32_t)(now - n.flashMs) >= 0) { seenSeq = n.flashSeq; animStart = n.flashMs; animating = true; }
   s.flash = 0;
   if (animating) { int dt = now - animStart; s.flash = dt >= 150 ? 0 : 1.0f - dt / 150.0f; }
 
-  bool full = first || s.link != last.link || s.mode != last.mode || s.bridgeOk != last.bridgeOk || s.viaBooth != last.viaBooth ||
+  bool full = first || s.link != last.link || s.mode != last.mode || s.bridgeOk != last.bridgeOk || s.direct != last.direct || s.perf != last.perf || s.viaBooth != last.viaBooth ||
               ((s.link == LS_WAIT) && s.radioOk != last.radioOk);
   if (full) {
     drawAll(s); first = false; lastStats = now;
@@ -497,8 +597,8 @@ void loop() {
   if (now - lastLog > 2000) {
     lastLog = now;
     static const char* LS[] = {"wait", "live", "hold", "take"};
-    Serial.printf("bpm %.1f beat %d %s bridge %s rssi %d snr %.1f rx %lu lost %lu sent %lu fail %lu\n", s.bpm, s.beatPos,
-                  LS[s.link], s.bridgeOk ? "ok" : "MISSING", s.rssi, s.snr, (unsigned long)s.rx, (unsigned long)s.lost,
+    Serial.printf("bpm %.1f beat %d %s source %s rssi %d snr %.1f rx %lu lost %lu sent %lu fail %lu\n", s.bpm, s.beatPos,
+                  LS[s.link], s.perf ? "PERF-1" : s.direct ? "USB S3" : s.bridgeOk ? "bridge" : "none", s.rssi, s.snr, (unsigned long)s.rx, (unsigned long)s.lost,
                   (unsigned long)s.sent, (unsigned long)s.fail);
   }
   delay(animating ? 1 : 5);

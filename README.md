@@ -12,6 +12,8 @@ BPM, flashes its 1.54" screen and RGB LED on every beat, and broadcasts each bea
 
 **The crew**
 - **Conductor:** Meshnology W10 (mic + LoRa), or the M5StickS3 Pocket Conductor (at the mic, relayed by the W10)
+- **USB audio conductor:** generic ESP32-S3 N16R8 receives digital audio from a phone/computer and sends beats over ESP-NOW
+- **PERF-1 conductor:** ESP32-S3 USB host reads PERF-1's MIDI clock and sends exact beats to the CYD
 - **Followers:** Heltec V3, the Piglet beat badge (and the XIAO kits, coming)
 - **Bridge:** Heltec V3, linking LoRa and ESP-NOW for the booth gear
 - **Booth controllers:** CYD console, M5Dial, M5Stack Tab5 Command Center, Cardputer ADV terminal, LilyGo T-Deck Plus Beat Deck (its own LoRa radio)
@@ -24,6 +26,42 @@ Formerly "W10 Beat Conductor". Companion project: [W10-ISM-Waterfall](https://gi
 
 **New:** the [Beat Command Center](#beat-command-center-m5stack-tab5) on the Tab5's 5" screen, and the [Beat Gateway](#beat-gateway-xiao-esp32-s3--beat-hub): a XIAO ESP32-S3 on USB that turns the beat link into MIDI clock, Ableton Link and OSC.
 Also: a touchscreen [booth console](#booth-console-cyd--heltec-v3-bridge) on a CYD that shows the beat link live and can take over the beat.
+
+## PERF-1 USB MIDI conductor (generic ESP32-S3 N16R8)
+
+Flash [PERF-1 S3 v1.2: GPIO48 onboard LED + GPIO18 strip](firmware/PERF1-S3-MIDI-Conductor-v1.2-GPIO48-Strip18-60LED.bin) to the S3 and [CYD console v1.2.0](firmware/CYD-Beat-Console-v1.2.0.bin) to the CYD at address **0x0**. If your board's onboard RGB LED is on GPIO38, use the [GPIO38 + GPIO18 strip build](firmware/PERF1-S3-MIDI-Conductor-v1.2-GPIO38-Strip18-60LED.bin) instead. The older CYD v1.1.0 also follows these beats but labels the source **USB S3** instead of **PERF-1**. Source: [`perf1_s3_midi_conductor/`](perf1_s3_midi_conductor/). Build with **esp32 by Espressif 3.3.10**, **ESP32S3 Dev Module**, **USB Mode: USB-OTG (TinyUSB)**, **USB CDC On Boot: Disabled**, **16 MB flash**, **QIO flash**, **OPI PSRAM**. The sketch itself uses ESP-IDF's USB host library and does not start the TinyUSB device stack.
+
+PERF-1 must have **MIDI out ON** and its own **USB host mode OFF**. Its normal USB device mode sends MIDI Start/Continue/Stop and 24 clock ticks per beat. The S3 host reads those ticks, calculates BPM from quarter-note intervals, and sends beat frames over ESP-NOW channel 1 directly to the CYD. The CYD shows **PERF-1** as the source. Both devices can have separate power; this setup does not route audio through the S3.
+
+**Two LED outputs at once (v1.2):** the onboard RGB on **GPIO48** and a **60-LED WS2812B strip on GPIO18** pulse on the same beats: brighter amber on beat 1, colored pulses on beats 2-4, and a new hue each bar. Both fade to black over 180 ms and stay off without beats. The strip has a separate 50% brightness setting and an estimated 900 mA current cap. The BOOT-button / UART `t` test pulses both outputs at 120 BPM for 10 seconds, even without PERF-1 connected. The older v1.1 builds only drive the onboard LED; they send no strip data on GPIO18.
+
+Connect strip **DIN** to the GPIO18 data signal and strip **GND** to S3 GND. Power the strip from a suitable **5 V supply**, sharing its ground with the S3; GPIO18 supplies data only. For a reliable 5 V strip connection, use a **74AHCT125 level shifter** between GPIO18 and DIN and a **330 ohm series resistor** near DIN. See [Adafruit's NeoPixel wiring guidance](https://learn.adafruit.com/adafruit-neopixel-uberguide/best-practices). Keep native USB GPIO19/20 for PERF-1.
+
+The UART startup log identifies v1.2, both LED pins, the strip length, and whether its driver initialized. Periodic logs include strip write errors. Source settings live in `perf1_s3_midi_conductor/beat_leds.h`: `BEAT_LED_GPIO` (48 or 38), `STRIP_GPIO` (18), `STRIP_LED_COUNT` (60), brightness, and estimated current cap. No extra LED library is needed. Ready-made v1.2 images are merged for address **0x0**; source builds use the **16M Flash (3MB APP/9.9MB FATFS)** partition scheme (`app3M_fat9M_16MB`).
+
+Use the S3's **native USB** port for PERF-1; its other USB-C port is the USB-to-UART port for flashing, power, and 115200 baud logs. The native USB connection must establish the S3 as USB host and present VBUS to the USB link for enumeration, even when PERF-1 powers itself. Generic two-port S3 boards may wire their USB-C receptacle as device-only, so a plain C-to-C cable may not enumerate; a correctly wired powered USB host adapter or breakout may be needed. The firmware log says `USB waiting` until a device enumerates, then prints the VID:PID and `PERF-1 MIDI ready`. `clocks` should rise while PERF-1 plays. Tap BOOT on the running S3 or send `t` on UART for a 10-second 120 BPM test to the CYD independent of USB.
+
+## USB audio conductor (generic ESP32-S3 N16R8)
+
+An analog AUX-to-USB-C cord plugged into the S3's built-in USB-C port does not produce USB audio packets. The firmware below requires a digital USB audio source. The S3's USB D−/D+ pins (GPIO19/20) are also ADC2-capable, but that alone does not provide a verified, safe analog AUX input: the cord's analog ground and USB-C audio accessory wiring must be established, the signal needs bias and protection, and ADC2 conflicts with Wi-Fi used for ESP-NOW. For analog AUX input without an external ADC module, use an ADC1 GPIO with proper AC coupling, bias, and attenuation.
+
+### Experimental analog USB-C pin capture
+
+The [GPIO48 build](firmware/Analog-USB-C-S3-Beat-Conductor-v0.2-GPIO48.bin) and [GPIO38 build](firmware/Analog-USB-C-S3-Beat-Conductor-v0.2-GPIO38.bin) sample **GPIO19 / USB D− as ADC2 channel 8** instead of running a USB protocol. They are merged 16 MB images for address **0x0**. Source: [`analog_usb_s3_beat_conductor/`](analog_usb_s3_beat_conductor/). The sketch takes 8 kHz mono samples, feeds the existing W10 beat engine, sends direct beat frames to the CYD over ESP-NOW, and flashes the S3 RGB LED. Use [CYD v1.2.0](firmware/CYD-Beat-Console-v1.2.0.bin) at address **0x0**. The UART USB-C port supplies the S3 and carries 115200 baud logs; the native USB-C port is treated solely as an analog input.
+
+This build is a **signal-path experiment**, not a verified plug-and-play AUX input. It can read a passive USB-C analog audio accessory only if its left channel reaches D− and its audio ground reaches the S3 ground, with the input voltage held within the S3 GPIO's safe range and biased for its ADC. USB-C analog audio accessory mode normally puts audio ground on SBU, which may be unconnected on a generic S3 board; an unconditioned audio waveform may go below ground. ADC2 may also lose samples while ESP-NOW's Wi-Fi radio is active. Do not apply an unknown analog signal directly to the USB-C port expecting the firmware to protect the pin. The UART log prints `signal YES/NO`, `ADC reads`, `errors`, `raw` minimum and maximum, detector `hops`, `level`, `conf`, and detected `BPM`. The quiet GPIO19 measurements supplied by the user varied by less than 150 ADC counts over two seconds; the firmware now requires three consecutive 8 ms windows with at least 220 counts of signal swing before running beat detection. It clears the old tempo when the signal disappears, so idle pin noise cannot keep broadcasting beats. BOOT or UART `t` sends a 10-second 120 BPM link test without audio.
+
+[`usb_s3_beat_conductor/usb_s3_beat_conductor.ino`](usb_s3_beat_conductor/usb_s3_beat_conductor.ino) makes the S3 appear as a 48 kHz, 16-bit stereo USB speaker. It converts the incoming samples to 16 kHz mono, runs the same beat detector as the StickS3, and sends beat frames on ESP-NOW channel 1 **directly to the CYD**. Flash the [S3 GPIO48 firmware](firmware/USB-S3-Beat-Conductor-v1.1-GPIO48.bin) (or [GPIO38 firmware](firmware/USB-S3-Beat-Conductor-v1.1-GPIO38.bin) if your onboard RGB LED uses that pin) and the updated [CYD firmware](firmware/CYD-Beat-Console-v1.2.0.bin) at address **0x0**, or build the sketches from source. The older CYD v1.0.5 binary ignores direct conductor frames. No W10, Heltec, or LoRa radio is needed for this two-board setup.
+
+Use a **generic ESP32-S3 N16R8 board whose USB connector is wired to native USB D−/D+ on GPIO19/20**. A connector wired only to a CH340/CP210x serial chip cannot receive USB audio. Flash with **esp32 by Espressif 3.3.10+**, board **ESP32S3 Dev Module**, **USB Mode: USB-OTG (TinyUSB)**, **USB CDC On Boot: Disabled**, **Flash Size: 16 MB**, **Flash Mode: QIO**, **PSRAM: OPI PSRAM**. Upload in bootloader mode if necessary; diagnostics use UART0 at 115200 because native USB is occupied by audio.
+
+Connect the S3 native USB port to an iPhone with a data-capable USB-C cable, then select **Beat Commander Audio Conductor** as the audio output if it is not selected automatically. Power the CYD separately. Play music and watch the CYD show **USB S3**, BPM, and beat flashes; the S3 UART log shows `USB audio`, confidence, and sent beats. Keep both boards on the same ESP-NOW channel and `LINK_NET_ID` (the sketch defaults match). Beat transmission starts after the detector has a confident tempo and stops on silence or missing USB audio. The four-count starts from the detected beat grid; the algorithm cannot reliably identify a musical downbeat from every track.
+
+The S3's onboard RGB LED flashes with each sent beat: amber on beat 1, colored pulses on beats 2-4, a new hue each bar, and a 180 ms fade. The BOOT-button 120 BPM link test flashes it too. Source builds can set `BEAT_LED_GPIO` to 48 or 38; the ready-made binaries cover both pins.
+
+**Quick link check:** tap the S3's BOOT button after it has started, or send `t` to its 115200 baud UART serial port. It sends a 120 BPM test beat for 10 seconds without needing USB audio. If the CYD flashes and its `rx` counter rises, the ESP-NOW link is working. The S3's log reports `mounted` (USB host configured), `speaker` (audio stream opened), and `chunks` (audio buffers received). If `chunks` stays at 0, the issue is before beat detection: check the native USB port, cable, and iPhone audio output selection.
+
+**To hear the music:** a bare N16R8 has no audio output. Set `DAC_ENABLED` to `1` in the sketch and attach a stereo I²S DAC (for example PCM5102A): GPIO4 → BCLK, GPIO5 → LRCK, GPIO6 → DIN, plus 3.3 V and GND as required by the DAC module. Connect the DAC's analog output to powered speakers or a mixer. With the default `DAC_ENABLED 0`, the S3 analyzes USB audio but does not play it through. Check the DAC module's voltage and pin labels before wiring.
 
 | W10 conductor (mic, LoRa TX) | Heltec V3 follower (LoRa RX) |
 |---|---|
@@ -50,13 +88,19 @@ Every board in the system has a ready-made `.bin`:
 | Meshnology W10 | Conductor (mic, LoRa TX) | [`firmware/W10-Beat-Conductor-v1.1.1.bin`](firmware/W10-Beat-Conductor-v1.1.1.bin) |
 | Heltec WiFi LoRa 32 V3 | Follower (flashes on the beat) | [`firmware/Beat-Follower-HeltecV3-v1.1.bin`](firmware/Beat-Follower-HeltecV3-v1.1.bin) |
 | Heltec WiFi LoRa 32 V3 | Bridge for the booth console | [`firmware/Beat-Bridge-HeltecV3-v1.1.bin`](firmware/Beat-Bridge-HeltecV3-v1.1.bin) |
-| CYD (ESP32-2432S028R) | Booth console | [`firmware/CYD-Beat-Console-v1.0.5.bin`](firmware/CYD-Beat-Console-v1.0.5.bin) |
+| CYD (ESP32-2432S028R) | Booth console / direct USB S3 beat display | [`firmware/CYD-Beat-Console-v1.2.0.bin`](firmware/CYD-Beat-Console-v1.2.0.bin) |
+| Generic ESP32-S3 N16R8 | USB audio conductor for CYD, GPIO48 LED | [`firmware/USB-S3-Beat-Conductor-v1.1-GPIO48.bin`](firmware/USB-S3-Beat-Conductor-v1.1-GPIO48.bin) |
+| Generic ESP32-S3 N16R8 | Same firmware, GPIO38 LED | [`firmware/USB-S3-Beat-Conductor-v1.1-GPIO38.bin`](firmware/USB-S3-Beat-Conductor-v1.1-GPIO38.bin) |
+| Generic ESP32-S3 N16R8 | Experimental analog USB-C pin capture, GPIO48 LED | [`firmware/Analog-USB-C-S3-Beat-Conductor-v0.2-GPIO48.bin`](firmware/Analog-USB-C-S3-Beat-Conductor-v0.2-GPIO48.bin) |
+| Generic ESP32-S3 N16R8 | Same experimental firmware, GPIO38 LED | [`firmware/Analog-USB-C-S3-Beat-Conductor-v0.2-GPIO38.bin`](firmware/Analog-USB-C-S3-Beat-Conductor-v0.2-GPIO38.bin) |
+| Generic ESP32-S3 N16R8 | PERF-1 USB MIDI host, GPIO48 onboard + GPIO18 strip (60 LEDs) | [`firmware/PERF1-S3-MIDI-Conductor-v1.2-GPIO48-Strip18-60LED.bin`](firmware/PERF1-S3-MIDI-Conductor-v1.2-GPIO48-Strip18-60LED.bin) |
+| Generic ESP32-S3 N16R8 | PERF-1 USB MIDI host, GPIO38 onboard + GPIO18 strip (60 LEDs) | [`firmware/PERF1-S3-MIDI-Conductor-v1.2-GPIO38-Strip18-60LED.bin`](firmware/PERF1-S3-MIDI-Conductor-v1.2-GPIO38-Strip18-60LED.bin) |
 | M5Stack M5Dial | Handheld takeover controller | [`firmware/M5Dial-Beat-Dial-v1.0.bin`](firmware/M5Dial-Beat-Dial-v1.0.bin) |
 | M5Stack StickS3 | Pocket conductor (mic) / beat badge | [`firmware/StickS3-Pocket-Conductor-v1.0.5.bin`](firmware/StickS3-Pocket-Conductor-v1.0.5.bin) |
 | Seeed XIAO ESP32-S3 | Beat Gateway (USB MIDI clock + feed for Beat Hub) | [`firmware/Beat-Gateway-XIAO-S3-v1.3.bin`](firmware/Beat-Gateway-XIAO-S3-v1.3.bin) |
 | LilyGo T-Dongle S3 | Beat Gateway Dongle: MIDI clock + Beat Hub feed, with a screen | [`firmware/TDongle-Beat-Gateway-v1.1.bin`](firmware/TDongle-Beat-Gateway-v1.1.bin) |
 | LilyGo T-Dongle C5 | Beat Light: USB beat light + Beat Hub feed (no MIDI) | [`firmware/TDongle-Beat-Light-C5-v1.1.bin`](firmware/TDongle-Beat-Light-C5-v1.1.bin) |
-| ESP32-C5 DevKit / Waveshare C5 | Beat Strip: drives an LED strip on the beat | [`firmware/C5-Beat-Strip-v1.0-devkit.bin`](firmware/C5-Beat-Strip-v1.0-devkit.bin) |
+| ESP32-C5 DevKit / Waveshare C5 | Beat Strip: drives an LED strip on the beat | [`firmware/C5-Beat-Strip-v1.1-GPIO19.bin`](firmware/C5-Beat-Strip-v1.1-GPIO19.bin) |
 | Seeed XIAO ESP32-C5 | Beat Strip (strip on D0) | [`firmware/C5-Beat-Strip-v1.0-xiao.bin`](firmware/C5-Beat-Strip-v1.0-xiao.bin) |
 | M5Stack Tab5 | Beat Command Center (big touch console, uses the Beat Gateway as its radio) | [`firmware/Tab5-Beat-Command-v1.0.5.bin`](firmware/Tab5-Beat-Command-v1.0.5.bin) |
 | M5Stack Cardputer ADV (or Cardputer) | Beat Commander terminal (keyboard booth controller) | [`firmware/Cardputer-Beat-Terminal-v1.0.1.bin`](firmware/Cardputer-Beat-Terminal-v1.0.1.bin) |
@@ -186,7 +230,7 @@ just two USB cables.
 ### Flash it (browser, no installs)
 
 Use the steps in [Flash it from the browser](#flash-it-from-the-browser-no-arduino-ide) with
-`CYD-Beat-Console-v1.0.5.bin` on the CYD and `Beat-Bridge-HeltecV3-v1.1.bin` on the Heltec V3.
+`CYD-Beat-Console-v1.2.0.bin` on the CYD and `Beat-Bridge-HeltecV3-v1.1.bin` on the Heltec V3.
 
 **First boot of the CYD:**
 1. **Display check.** CYD batches use different panels, so the image can come out mirrored or with red and
@@ -206,17 +250,24 @@ The console uses the resistive-touch CYD (ESP32-2432S028R, XPT2046).
 | **◀** / **▶** | Move the beat 10 ms earlier / later (takeover only) |
 | **TAKE** / **RELEASE** | Take the beat from the W10 at its current tempo and phase, or hand it back |
 | Hold the header 2 s | Rotate 180° (remembered) |
+| Tap the large BPM / listening area | Open full-screen visuals |
+| Tap a visual | Next effect (all eleven visualizer modes) |
+| Hold a visual for 1 s, then release | Return to the BPM console |
+| Tap AUTO at the top right of a visual | Toggle automatic effect changes every eight bars |
 
-Status pill: **WAIT** (nothing heard yet), **LIVE** (following the W10), **HOLD** (packets dropped, flywheel
-keeps time for 4 s), **TAKE** (the booth is driving), **NO LINK** (no bridge heard for 3 s).
+Status pill: **WAIT** (nothing heard yet), **LIVE** (following a conductor), **HOLD** (packets dropped, flywheel
+keeps time for 4 s), **TAKE** (the console is driving), **NO LINK** (no direct S3 beat or bridge heard).
+With the USB S3, the CYD shows **USB S3** as its source and receives beats directly over ESP-NOW.
+
+**Combined console and visuals (v1.2.0):** flash [CYD firmware](firmware/CYD-Beat-Console-v1.2.0.bin) at **0x0**. The visual page uses the same received BPM, beat position, beat timing and hue as the console, including direct S3 beats; it does not start a demo beat when the link stops. Effects: PULSE, TUNNEL, BARS, WARP, PLASMA, BPM, KALEIDO, GRID, PYRAMID, FIREWORKS and RAIN. Effect and AUTO settings are saved, and the board starts on the console page. Build with **esp32 3.3.10**, **ESP32 Dev Module**, **Huge APP**, and **LovyanGFX**. The full-screen canvas uses 8-bit color to fit the CYD's RAM; the existing band renderer sends it to the display in 16-bit color.
 
 **Takeover:** TAKE continues the W10's beat grid without a skip, so the room doesn't see a glitch. Then switch
 the W10's **LORA TX** off (hold BOOT 1 s on it). If the console still hears the W10, a red banner says so:
 two transmitters on the link collide. RELEASE hands back; followers flywheel until the W10 is on air again.
 The bridge carries the W10's sequence numbers on, so followers don't count false losses.
 
-During takeover the console flashes 11 ms after it sends (`LINK_AIR_MS`), which is when the followers
-actually flash after LoRa airtime, so the booth screen and the crowd stay in sync.
+With a bridge, takeover flashes 11 ms after sending (`LINK_AIR_MS`), matching LoRa airtime for the followers.
+With no bridge, TAKE runs locally on the CYD and flashes immediately.
 
 The CYD's RGB LED flashes with the beat too; the Heltec's white LED blinks per beat heard and double-blinks
 per beat sent.
@@ -609,8 +660,10 @@ lighting: a strip along the booth front or behind the decks. Above: each pattern
 | **SPARKLE** | random LEDs catch every beat, more on beat 1 |
 | **RAINBOW** | a rainbow that steps along on every beat |
 
-With no beat it breathes amber softly. The board's own LED flashes too. It also prints the Beat Gateway's serial
+The DevKit GPIO19 build stays dark while waiting for beats; the XIAO build breathes amber softly. After a link interruption it follows the existing eight-beat flywheel before returning to waiting. The board's own LED flashes too. It also prints the Beat Gateway's serial
 feed, so plugged into the Pi it can feed Beat Hub (Ableton Link + OSC, no MIDI clock).
+
+**S3 direct beat build:** [C5 GPIO19 firmware v1.1](firmware/C5-Beat-Strip-v1.1-GPIO19.bin), merged image for flash address **0x0**. It receives the S3's direct ESP-NOW beat frames on channel 1 and flashes the strip using their BPM, beat position and hue. The first boot after upgrading sets GPIO19, PULSE and AUTO off even if older settings exist; later serial changes remain saved. Default strip length is 60 LEDs (`leds <n>` changes it), brightness 50%, current limit 900 mA. PULSE fades without the old constant brightness floor. Status identifies direct beats as `S3`. Build: **esp32 3.3.10**, **ESP32C5 Dev Module**, **USB CDC On Boot Enabled**, **Huge APP**.
 
 **Wiring** (three wires, no soldering if your board has header pins; JST-to-Dupont jumpers fit most strips):
 
@@ -618,7 +671,7 @@ feed, so plugged into the Pi it can feed Beat Hub (Ableton Link + OSC, no MIDI c
 |---|---|
 | 5V (red) | 5V / VBUS |
 | GND (white or black) | GND |
-| DIN, data (green) | **GPIO1** (on the XIAO: **D0**). Change with `pin <gpio>`. |
+| DIN, data (green) | **GPIO19** on DevKit / Waveshare with v1.1; **GPIO1 / D0** on XIAO. Change with `pin <gpio>`. |
 
 Up to about 60 LEDs run off the board's USB from a charger or power bank: the firmware caps the current (900 mA by
 default, `limit <mA>`). For longer strips, power the strip from its own 5V supply and join its GND to the board's GND.
